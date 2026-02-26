@@ -9,14 +9,21 @@
       rel="stylesheet"
     />
     <style>
+      :root {
+        --primary-color: #00539b; /* TAV tarzı mavi */
+        --accent-color: #f59e0b;  /* Vurgu rengi (turuncu) */
+      }
+
       body {
         background-color: #f4f6f8;
       }
       .kpi-card {
         min-height: 120px;
+        border-top: 3px solid var(--primary-color);
       }
       .risk-badge {
-        font-size: 0.8rem;
+        font-size: 0.95rem;
+        padding: 0.25rem 0.5rem;
       }
       .table-hover tbody tr {
         cursor: pointer;
@@ -26,17 +33,53 @@
         grid-template-columns: 2fr 1.8fr;
         gap: 1rem;
       }
+      /* Sol kolondaki kartlar icin biraz daha fazla bosluk */
+      .layout > div:first-child .card {
+        margin-bottom: 1.25rem;
+      }
+
       @media (max-width: 992px) {
         .layout {
           grid-template-columns: 1fr;
         }
       }
+      /* Kart basliklarinda daha kuvvetli hiyerarsi icin */
+      .card-header {
+        background-color: var(--primary-color);
+        color: #ffffff;
+        font-weight: 600;
+      }
+
+      /* Kart icindeki aciklayici alt metinler icin daha belirgin stil */
+      .card-header small.text-muted {
+        color: #e5e7eb !important; /* acik gri-beyaz */
+        font-size: 0.9rem;
+        font-weight: 400;
+      }
+
+      /* Tablo satirlarinda daha rahat satir yuksekligi */
+      .table-sm td,
+      .table-sm th {
+        padding-top: 0.45rem;
+        padding-bottom: 0.45rem;
+      }
+
+      /* Musteri ozet karti altina ince ayirici cizgi */
+      #customerSummary {
+        padding-bottom: 0.75rem;
+        border-bottom: 1px solid #e0e0e0;
+      }
     </style>
   </head>
   <body>
     <div class="container-fluid py-3">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <h2 class="mb-0">Alacak Tahsilat Takip Paneli</h2>
+      <div
+        class="d-flex flex-column flex-lg-row justify-content-between align-items-lg-center mb-3"
+      >
+        <div class="mb-2 mb-lg-0">
+          <h2 class="mb-0 fs-2">Alacak Tahsilat Takip Paneli</h2>
+          <div class="text-muted small">Toplantı Modu · Canlı Data</div>
+        </div>
         <span class="badge bg-secondary" id="costOfCashBadge"></span>
       </div>
 
@@ -103,6 +146,10 @@
                 Toplam Finansal Kayıp:
                 <span class="fw-semibold" id="kpiTotalLateLoss">-</span>
               </div>
+              <div class="small text-muted">
+                Güncel Vade Farkı (Tahakkuk):
+                <span class="fw-semibold" id="kpiLateFeeUnpaid">-</span>
+              </div>
               <span class="badge bg-primary-subtle text-primary risk-badge mt-2"
                 >Risk Skoru: <span id="kpiRiskScore">-</span></span
               >
@@ -139,7 +186,16 @@
 
           <div class="card shadow-sm">
             <div class="card-header d-flex justify-content-between align-items-center">
-              <span id="topCustomersTitle">En Riskli 10 Müşteri (Genel)</span>
+              <span id="topCustomersTitle">
+                <a
+                  id="topCustomersTitleLink"
+                  href="top_risky.html"
+                  class="text-white text-decoration-none"
+                  title="Detay listeyi aç"
+                >
+                  En Riskli 10 Müşteri (Genel)
+                </a>
+              </span>
             </div>
             <div class="card-body p-0">
               <div class="table-responsive" style="max-height: 320px;">
@@ -150,6 +206,60 @@
                   <thead class="table-light">
                     <tr>
                       <th>Müşteri</th>
+                      <th class="text-end">Açık</th>
+                      <th class="text-end">Overdue</th>
+                      <th class="text-end">90+</th>
+                      <th class="text-end">Risk</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Finansal kaybi en yuksek musteriler icin ayri kart -->
+          <div class="card shadow-sm mt-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span id="topLossCustomersTitle">Finansal Kayıp En Yüksek 10 Müşteri (Genel)</span>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive" style="max-height: 320px;">
+                <table
+                  class="table table-sm table-hover mb-0"
+                  id="customersLossTable"
+                >
+                  <thead class="table-light">
+                    <tr>
+                      <th>Müşteri</th>
+                      <th class="text-end">Açık</th>
+                      <th class="text-end">Overdue</th>
+                      <th class="text-end">90+</th>
+                      <th class="text-end">Kayıp</th>
+                      <th class="text-end">Risk</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Odenmemis fatura adedi en yuksek musteriler icin kart -->
+          <div class="card shadow-sm mt-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span id="topUnpaidCustomersTitle">Ödenmeyen Fatura Sayısı En Yüksek 10 Müşteri (Genel)</span>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive" style="max-height: 320px;">
+                <table
+                  class="table table-sm table-hover mb-0"
+                  id="customersUnpaidTable"
+                >
+                  <thead class="table-light">
+                    <tr>
+                      <th>Müşteri</th>
+                      <th class="text-end">Ödenmeyen Fatura</th>
                       <th class="text-end">Açık</th>
                       <th class="text-end">Overdue</th>
                       <th class="text-end">90+</th>
@@ -215,9 +325,9 @@
                     <tr>
                       <th>Fatura</th>
                       <th>Valör</th>
-                      <th class="text-end">Gecikme</th>
-                      <th class="text-end">Tutar (TRY)</th>
-                      <th class="text-end">Kayıp</th>
+                      <th class="text-end">Gecikme (gün)</th>
+                      <th class="text-end">Uygulanan Tutar (TRY)</th>
+                      <th class="text-end">Geç Ödeme Kayıp (TRY)</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
@@ -230,8 +340,11 @@
     </div>
 
     <script>
-      // API Base URL - Render backend URL'si
-      const API_BASE = "https://tahsilat-backend.onrender.com";
+      // Lokal gelistirme icin backend ile ayni origin'i kullan
+      // Uvicorn'u 127.0.0.1:8000'de calistirip
+      // tarayicidan http://127.0.0.1:8000/static/index.html acarsan
+      // API_BASE'i bos birakmak en temizi:
+      const API_BASE = "";
 
       function fmtAmount(val) {
         if (val == null) return "-";
@@ -355,6 +468,8 @@
           fmtAmount(data.loss_30d);
         document.getElementById("kpiTotalLateLoss").innerText =
           fmtAmount(data.total_late_loss);
+        document.getElementById("kpiLateFeeUnpaid").innerText =
+          fmtAmount(data.late_fee_unpaid_total);
         document.getElementById("kpiRiskScore").innerText = data.risk_score.toFixed
           ? data.risk_score.toFixed(2)
           : data.risk_score;
@@ -381,23 +496,26 @@
               )}">${r.risk_score.toFixed(1)}</span>
             </td>
           `;
-          tr.addEventListener("click", () =>
-            loadTopCustomers(r.region_id, r.region_name)
-          );
+          tr.addEventListener("click", () => {
+            loadTopCustomers(r.region_id, r.region_name);
+            loadTopLossCustomers(r.region_id, r.region_name);
+            loadTopUnpaidCustomers(r.region_id, r.region_name);
+          });
           tbody.appendChild(tr);
         });
       }
 
       async function loadTopCustomers(regionId = null, regionName = null) {
+        // En riskli musteriler (risk_score'a gore)
         let url = API_BASE + "/customers/top-risky?limit=10";
         if (regionId !== null && regionId !== undefined) {
           url += "&region_id=" + regionId;
           document.getElementById(
-            "topCustomersTitle"
+            "topCustomersTitleLink"
           ).innerText = `En Riskli 10 Müşteri – ${regionName}`;
         } else {
           document.getElementById(
-            "topCustomersTitle"
+            "topCustomersTitleLink"
           ).innerText = "En Riskli 10 Müşteri (Genel)";
         }
 
@@ -409,6 +527,85 @@
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td>${c.customer_name}</td>
+            <td class="text-end">${fmtAmount(c.total_open)}</td>
+            <td class="text-end">${fmtAmount(c.overdue)}</td>
+            <td class="text-end">${fmtAmount(c.over90)}</td>
+            <td class="text-end">
+              <span class="badge ${riskColor(
+                c.risk_score
+              )}">${c.risk_score.toFixed(1)}</span>
+            </td>
+          `;
+          tr.addEventListener("click", () =>
+            loadCustomerDetail(c.customer_no, c.customer_name)
+          );
+          tbody.appendChild(tr);
+        });
+      }
+
+      async function loadTopLossCustomers(regionId = null, regionName = null) {
+        // Finansal kaybi en yuksek musteriler
+        let url = API_BASE + "/customers/top-risky?limit=10&sort_by=loss";
+        if (regionId !== null && regionId !== undefined) {
+          url += "&region_id=" + regionId;
+          document.getElementById(
+            "topLossCustomersTitle"
+          ).innerText = `Finansal Kayıp En Yüksek 10 Müşteri – ${regionName}`;
+        } else {
+          document.getElementById(
+            "topLossCustomersTitle"
+          ).innerText = "Finansal Kayıp En Yüksek 10 Müşteri (Genel)";
+        }
+
+        const res = await fetch(url);
+        const customers = await res.json();
+        const tbody = document.querySelector("#customersLossTable tbody");
+        tbody.innerHTML = "";
+        customers.forEach((c) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${c.customer_name}</td>
+            <td class="text-end">${fmtAmount(c.total_open)}</td>
+            <td class="text-end">${fmtAmount(c.overdue)}</td>
+            <td class="text-end">${fmtAmount(c.over90)}</td>
+            <td class="text-end">${fmtAmount(c.total_late_loss)}</td>
+            <td class="text-end">
+              <span class="badge ${riskColor(
+                c.risk_score
+              )}">${c.risk_score.toFixed(1)}</span>
+            </td>
+          `;
+          tr.addEventListener("click", () =>
+            loadCustomerDetail(c.customer_no, c.customer_name)
+          );
+          tbody.appendChild(tr);
+        });
+      }
+
+      async function loadTopUnpaidCustomers(regionId = null, regionName = null) {
+        // Odenmeyen fatura adedi en yuksek musteriler
+        let url = API_BASE + "/customers/top-unpaid?limit=10";
+        if (regionId !== null && regionId !== undefined) {
+          url += "&region_id=" + regionId;
+          document.getElementById(
+            "topUnpaidCustomersTitle"
+          ).innerText = `Ödenmeyen Fatura Sayısı En Yüksek 10 Müşteri – ${regionName}`;
+        } else {
+          document.getElementById(
+            "topUnpaidCustomersTitle"
+          ).innerText =
+            "Ödenmeyen Fatura Sayısı En Yüksek 10 Müşteri (Genel)";
+        }
+
+        const res = await fetch(url);
+        const customers = await res.json();
+        const tbody = document.querySelector("#customersUnpaidTable tbody");
+        tbody.innerHTML = "";
+        customers.forEach((c) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${c.customer_name}</td>
+            <td class="text-end">${c.unpaid_invoice_count}</td>
             <td class="text-end">${fmtAmount(c.total_open)}</td>
             <td class="text-end">${fmtAmount(c.overdue)}</td>
             <td class="text-end">${fmtAmount(c.over90)}</td>
@@ -487,7 +684,7 @@
             <td>${p.ar_invoice_no || ""}</td>
             <td>${p.value_date || ""}</td>
             <td class="text-end">${p.delay_days}</td>
-            <td class="text-end">${fmtAmount(p.payment_amount_try)}</td>
+            <td class="text-end">${fmtAmount(p.applied_amount)}</td>
             <td class="text-end">${fmtAmount(p.loss)}</td>
           `;
           payBody.appendChild(tr);
@@ -498,6 +695,8 @@
         await loadDashboard();
         await loadRegions();
         await loadTopCustomers();
+        await loadTopLossCustomers();
+        await loadTopUnpaidCustomers();
       }
 
       init().catch((err) => {

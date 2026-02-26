@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Date, Float, ForeignKey, Integer, String
+from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, String
+from datetime import datetime
 
 from .db import Base
 
@@ -58,6 +59,23 @@ class Setting(Base):
 
     key = Column(String, primary_key=True, index=True)
     value = Column(Float)
+
+
+class Action(Base):
+    """
+    Toplantida alinan musteri bazli aksiyonlar.
+    Basit tutuldu: simdilik sadece musteri, aksiyon tipi, not ve zaman.
+    """
+
+    __tablename__ = "actions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    customer_no = Column(String, index=True)
+    customer_name = Column(String)
+    action_type = Column(String)  # ornek: 'sure', 'vade_farki', 'ihtar', 'icra', 'fesih'
+    note = Column(String)
+    status = Column(String, default="open")  # open / done
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 

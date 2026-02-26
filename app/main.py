@@ -19,10 +19,15 @@ from .importers import (
     import_payments_df,
 )
 from .metrics import calculate_late_loss_payment
-from .models import Customer, Invoice, Payment, Region, Setting
+from .models import Action, Customer, Invoice, Payment, Region, Setting
 from .risk_score import calculate_risk_score
-from .schemas import SettingsUpdate
-from .settings import get_cost_of_cash_annual, set_cost_of_cash_annual
+from .schemas import ActionCreate, ActionOut, SettingsUpdate
+from .settings import (
+    get_cost_of_cash_annual,
+    get_late_fee_rate_annual,
+    set_cost_of_cash_annual,
+    set_late_fee_rate_annual,
+)
 
 
 # Tabloları oluştur
@@ -154,8 +159,9 @@ def dashboard(db: Session = Depends(get_db)):
                 o90_bucket = over90_by_currency.setdefault(cur, {"over90": 0.0})
                 o90_bucket["over90"] += ob
 
-    # Settings: cost_of_cash (yillik %)
+    # Settings: cost_of_cash ve late_fee_rate (yillik %)
     cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    late_fee_rate = get_late_fee_rate_annual(db, default=36.0)
 
     # Son 30 gunde tum odemeler icin gec odeme kaybi (delay_days <= 0 olan satirlar fonksiyonda zaten 0 donecek)
     last_30 = today - timedelta(days=30)
@@ -166,6 +172,20 @@ def dashboard(db: Session = Depends(get_db)):
     # Toplam (tarihten bagimsiz) tum odemeler icin gec odeme kaybi
     total_late_loss = sum(calculate_late_loss_payment(p, cost_of_cash) for p in payments)
     total_late_loss_rows = len(payments)
+
+    # Odenmemis faturalar icin GUNCEL vade farki (tahakkuk) hesaplama
+    # late_fee = open_balance * days_overdue * (late_fee_rate_annual / 100 / 365)
+    daily_late_fee_rate = (late_fee_rate / 100.0) / 365.0
+    total_late_fee_unpaid = 0.0
+    for inv in invoices:
+        if inv.open_balance is None or inv.open_balance <= 0:
+            continue
+        if inv.due_date is None or inv.due_date >= today:
+            continue
+        days_overdue = (today - inv.due_date).days
+        if days_overdue <= 0:
+            continue
+        total_late_fee_unpaid += inv.open_balance * days_overdue * daily_late_fee_rate
 
     overdue_ratio = overdue / total_open if total_open else 0.0
     over90_ratio = over90 / overdue if overdue else 0.0
@@ -191,6 +211,8 @@ def dashboard(db: Session = Depends(get_db)):
         "total_late_loss_rows": total_late_loss_rows,
         "risk_score": risk,
         "cost_of_cash_annual": cost_of_cash,
+        "late_fee_rate_annual": late_fee_rate,
+        "late_fee_unpaid_total": total_late_fee_unpaid,
         "totals_by_currency": [
             {"currency": cur, "total_open": vals["total_open"]}
             for cur, vals in totals_by_currency.items()
@@ -295,6 +317,10 @@ def _customer_metrics(
             db.query(Payment).filter(Payment.customer_no == customer_no).all()
         )
 
+    # Odenmemis fatura (open_balance > 0) adedi
+    unpaid_invoices = [i for i in invoices if (i.open_balance or 0.0) > 0.0]
+    unpaid_invoice_count = len(unpaid_invoices)
+
     total_open = sum(i.open_balance or 0 for i in invoices)
     overdue = sum(
         i.open_balance or 0
@@ -339,6 +365,19 @@ def _customer_metrics(
         calculate_late_loss_payment(p, cost_of_cash) for p in payments
     )
 
+    # Odenmemis faturalar icin musterinin GUNCEL vade farki (tahakkuk) tutari
+    late_fee_rate = get_late_fee_rate_annual(db, default=36.0)
+    daily_late_fee_rate = (late_fee_rate / 100.0) / 365.0
+    late_fee_unpaid = 0.0
+    for inv in unpaid_invoices:
+        if inv.due_date is None or inv.due_date >= today:
+            continue
+        days_overdue = (today - inv.due_date).days
+        if days_overdue <= 0:
+            continue
+        ob = inv.open_balance or 0.0
+        late_fee_unpaid += ob * days_overdue * daily_late_fee_rate
+
     overdue_ratio = overdue / total_open if total_open else 0.0
     over90_ratio = over90 / overdue if overdue else 0.0
     loss_ratio = loss_30 / total_open if total_open else 0.0
@@ -355,6 +394,8 @@ def _customer_metrics(
         "total_open": total_open,
         "overdue": overdue,
         "over90": over90,
+        "unpaid_invoice_count": unpaid_invoice_count,
+        "late_fee_unpaid": late_fee_unpaid,
         "weighted_overdue_days": weighted_days,
         "loss_30d": loss_30,
         "total_late_loss": total_late_loss_customer,
@@ -366,10 +407,102 @@ def _customer_metrics(
 def top_risky_customers(
     limit: int = 10,
     region_id: int | None = None,
+    sort_by: str = "risk",
     db: Session = Depends(get_db),
 ):
     """
-    En riskli N musteri (risk skoruna gore sirali).
+    En riskli N musteri (risk skoru veya finansal kayip siralamasina gore).
+
+    sort_by:
+      - "risk" (varsayilan): risk_score'a gore azalan
+      - "overdue": vadesi gecmis bakiye (overdue) gore azalan
+      - "unpaid": odenmemis fatura sayisi (unpaid_invoice_count) gore azalan
+      - "loss": toplam finansal kayip (total_late_loss) gore azalan
+    """
+    today = date.today()
+    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+
+    query = db.query(Customer)
+    if region_id is not None:
+        query = query.filter(Customer.region_id == region_id)
+
+    customers = query.all()
+    raw_results: List[Dict] = []
+    for c in customers:
+        m = _customer_metrics(db, c.customer_no, cost_of_cash, today)
+        # Hic acik bakiyesi ve hic kaybi yoksa listeye alma
+        if (
+            m["total_open"] <= 0
+            and m["loss_30d"] <= 0
+            and m["total_late_loss"] <= 0
+            and m["unpaid_invoice_count"] <= 0
+        ):
+            continue
+        m["customer_name"] = c.name
+        m["region_id"] = c.region_id
+        raw_results.append(m)
+
+    # sort_by == "loss" icin ayni musteriyi (isim bazli) tek satira indir ve
+    # finansal kayiplarini toplama yontemiyle birlestir.
+    if sort_by == "loss":
+        grouped: Dict[str, Dict] = {}
+        for m in raw_results:
+            key = m.get("customer_name") or m.get("customer_no")
+            if key not in grouped:
+                grouped[key] = dict(m)
+            else:
+                g = grouped[key]
+                # Tutarlar icin toplama
+                g["total_open"] += m["total_open"]
+                g["overdue"] += m["overdue"]
+                g["over90"] += m["over90"]
+                g["loss_30d"] += m["loss_30d"]
+                g["total_late_loss"] += m["total_late_loss"]
+                g["unpaid_invoice_count"] += m["unpaid_invoice_count"]
+                g["late_fee_unpaid"] += m.get("late_fee_unpaid", 0.0)
+                # Risk skorunu kabaca en yuksek degerle temsil et
+                if m["risk_score"] > g["risk_score"]:
+                    g["risk_score"] = m["risk_score"]
+        results = list(grouped.values())
+        results.sort(key=lambda x: x["total_late_loss"], reverse=True)
+    else:
+        # Diger siralama kriterleri icin customer_no bazli listeyi kullan
+        results = list(raw_results)
+        if sort_by == "overdue":
+            results.sort(key=lambda x: x["overdue"], reverse=True)
+        elif sort_by == "unpaid":
+            results.sort(key=lambda x: x["unpaid_invoice_count"], reverse=True)
+        else:
+            # Varsayilan: risk skoru
+            results.sort(key=lambda x: x["risk_score"], reverse=True)
+
+    return results[: max(1, limit)]
+
+
+@app.get("/customers")
+def list_customers(db: Session = Depends(get_db)):
+    """
+    Tum musterilerin basit listesi (dropdown icin).
+    """
+    customers = db.query(Customer).all()
+    return [
+        {
+            "customer_no": c.customer_no,
+            "customer_name": c.name,
+            "region_id": c.region_id,
+        }
+        for c in customers
+    ]
+
+
+@app.get("/customers/top-unpaid")
+def top_unpaid_customers(
+    limit: int = 10,
+    region_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Odenmemis fatura adedi en yuksek musteriler.
     """
     today = date.today()
     cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
@@ -382,14 +515,13 @@ def top_risky_customers(
     results: List[Dict] = []
     for c in customers:
         m = _customer_metrics(db, c.customer_no, cost_of_cash, today)
-        # Hic acik bakiyesi yoksa listeye alma
-        if m["total_open"] <= 0 and m["loss_30d"] <= 0:
+        if m["unpaid_invoice_count"] <= 0:
             continue
         m["customer_name"] = c.name
         m["region_id"] = c.region_id
         results.append(m)
 
-    results.sort(key=lambda x: x["risk_score"], reverse=True)
+    results.sort(key=lambda x: x["unpaid_invoice_count"], reverse=True)
     return results[: max(1, limit)]
 
 
@@ -619,7 +751,13 @@ def customer_late_payments(customer_no: str, db: Session = Depends(get_db)):
     Musterinin gec odemeleri (delay_days > 0 olan payments satirlari).
     """
     cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
-    payments = db.query(Payment).filter(Payment.customer_no == customer_no).all()
+
+    # Customer_no ile kayitli musteri adini bul, varsa payments'i isim uzerinden filtrele
+    customer = db.query(Customer).filter(Customer.customer_no == customer_no).first()
+    if customer and customer.name:
+        payments = db.query(Payment).filter(Payment.customer_name == customer.name).all()
+    else:
+        payments = db.query(Payment).filter(Payment.customer_no == customer_no).all()
 
     result = []
     for p in payments:
@@ -735,19 +873,63 @@ def customer_financial_loss_export(customer_no: str, db: Session = Depends(get_d
 @app.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
     """
-    Sistem parametreleri (su an icin sadece cost_of_cash_annual).
+    Sistem parametreleri (su an icin cost_of_cash_annual ve late_fee_rate_annual).
     """
-    value = get_cost_of_cash_annual(db, default=45.0)
-    return {"cost_of_cash_annual": value}
+    cost_of_cash_value = get_cost_of_cash_annual(db, default=45.0)
+    late_fee_value = get_late_fee_rate_annual(db, default=36.0)
+    return {
+        "cost_of_cash_annual": cost_of_cash_value,
+        "late_fee_rate_annual": late_fee_value,
+    }
 
 
 @app.put("/settings")
 def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     """
-    Sistem parametrelerini gunceller (su an icin sadece cost_of_cash_annual).
+    Sistem parametrelerini gunceller (cost_of_cash_annual ve late_fee_rate_annual).
     """
     set_cost_of_cash_annual(db, payload.cost_of_cash_annual)
-    return {"cost_of_cash_annual": payload.cost_of_cash_annual}
+    set_late_fee_rate_annual(db, payload.late_fee_rate_annual)
+    return {
+        "cost_of_cash_annual": payload.cost_of_cash_annual,
+        "late_fee_rate_annual": payload.late_fee_rate_annual,
+    }
+
+
+@app.post("/actions", response_model=ActionOut)
+def create_action(payload: ActionCreate, db: Session = Depends(get_db)):
+    """
+    Toplantida alinan tek bir musteri aksiyonunu kaydeder.
+    Simdilik basit tutuyoruz: owner_user / due_date vs. yok.
+    """
+    action = Action(
+        customer_no=payload.customer_no,
+        customer_name=payload.customer_name,
+        action_type=payload.action_type,
+        note=payload.note,
+        status="open",
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@app.get("/actions", response_model=List[ActionOut])
+def list_actions(
+    customer_no: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Kaydedilmis aksiyonlar listesi.
+    - customer_no verilirse sadece o musterinin aksiyonlarini dondurur.
+    - Simdilik created_at desc sirali, frontend musteribasinda en son kaydi kullanacak.
+    """
+    query = db.query(Action)
+    if customer_no:
+        query = query.filter(Action.customer_no == customer_no)
+    actions = query.order_by(Action.created_at.desc()).all()
+    return actions
 
 
 # Uvicorn ile calistirmak icin:

@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>En Riskli Müşteriler – Alacak Tahsilat Takip Paneli</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --primary-color: #00539b;
+        --accent-color: #f59e0b;
+      }
+
+      body {
+        background-color: #f4f6f8;
+      }
+
+      .card-header {
+        background-color: var(--primary-color);
+        color: #ffffff;
+        font-weight: 600;
+      }
+
+      .risk-badge {
+        font-size: 0.95rem;
+        padding: 0.25rem 0.5rem;
+      }
+
+      .card-header small.text-muted {
+        color: #e5e7eb !important;
+        font-size: 0.9rem;
+        font-weight: 400;
+      }
+
+      .table-sm td,
+      .table-sm th {
+        padding-top: 0.45rem;
+        padding-bottom: 0.45rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container-fluid py-3">
+      <div
+        class="d-flex flex-column flex-lg-row justify-content-between align-items-lg-center mb-3"
+      >
+        <div class="mb-2 mb-lg-0">
+          <h2 class="mb-0 fs-2">En Riskli Müşteriler</h2>
+          <div
+            class="text-muted small d-flex flex-wrap align-items-center gap-3 mt-1"
+          >
+            <span>Risk Skoruna Göre Sıralı · Detay Liste</span>
+            <div class="d-flex align-items-center gap-1">
+              <span>Bölge:</span>
+              <select
+                id="regionFilter"
+                class="form-select form-select-sm"
+                style="min-width: 180px"
+              >
+                <option value="">Tüm Bölgeler</option>
+              </select>
+            </div>
+            <div class="d-flex align-items-center gap-1">
+              <span>Sıralama:</span>
+              <select
+                id="sortFilter"
+                class="form-select form-select-sm"
+                style="min-width: 220px"
+              >
+                <option value="risk">Riske Göre Sırala</option>
+                <option value="overdue">Vadesi Geçmiş Bakiyeye Göre Sırala</option>
+                <option value="unpaid">Ödenmemiş Fatura Sayısına Göre Sırala</option>
+                <option value="loss">Finansal Kayıp Tutarına Göre Sırala</option>
+              </select>
+            </div>
+            <div class="d-flex align-items-center gap-1">
+              <span>Tüm Müşteriler:</span>
+              <select
+                id="allCustomersSelect"
+                class="form-select form-select-sm"
+                style="min-width: 240px"
+              >
+                <option value="">Müşteri seçin...</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex flex-column align-items-lg-end gap-2">
+          <div class="small text-muted">
+            Güncel Vade Farkı (Tahakkuk):
+            <span class="fw-semibold" id="lateFeeUnpaidTotal">-</span>
+          </div>
+          <a href="index.html" class="btn btn-outline-secondary btn-sm">
+            Ana Sayfaya Dön
+          </a>
+        </div>
+      </div>
+
+      <div class="card shadow-sm">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>En Riskli Müşteri Listesi</span>
+          <small class="text-muted">Varsayılan: İlk 50 müşteri</small>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive" style="max-height: calc(100vh - 140px);">
+            <table
+              class="table table-sm table-hover mb-0"
+              id="topRiskTable"
+            >
+              <thead class="table-light">
+                <tr>
+                  <th>#</th>
+                  <th>Müşteri</th>
+                  <th class="text-end">Toplam Alacak</th>
+                  <th class="text-end">Vadesi Geçmiş Bakiye</th>
+                  <th class="text-end">90+</th>
+                  <th class="text-end">Finansal Kayıp</th>
+                  <th class="text-end">Güncel Vade Farkı</th>
+                  <th class="text-end">Ödenmemiş Fatura Sayısı</th>
+                  <th class="text-end">Risk Skoru</th>
+                  <th>Aksiyon</th>
+                  <th>Not</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // Lokal geliştirme icin backend ile ayni origin
+      const API_BASE = "";
+      let currentRegionId = "";
+      let currentSort = "risk";
+
+      function fmtAmount(val) {
+        if (val == null) return "-";
+        const n = Number(val);
+        if (isNaN(n)) return "-";
+        if (Math.abs(n) >= 1_000_000_000) {
+          return (n / 1_000_000_000).toFixed(1) + " B";
+        }
+        if (Math.abs(n) >= 1_000_000) {
+          return (n / 1_000_000).toFixed(1) + " M";
+        }
+        return n.toLocaleString("tr-TR", {
+          maximumFractionDigits: 0,
+        });
+      }
+
+      function riskColor(score) {
+        if (score >= 80) return "bg-danger";
+        if (score >= 60) return "bg-warning text-dark";
+        if (score >= 30) return "bg-info text-dark";
+        return "bg-success";
+      }
+
+      async function loadTopRisk(regionId = "", sortBy = "risk") {
+        // Daha geniş liste için limit'i 50 yaptım
+        let url =
+          API_BASE +
+          "/customers/top-risky?limit=50&sort_by=" +
+          encodeURIComponent(sortBy || "risk");
+        if (regionId) {
+          url += "&region_id=" + encodeURIComponent(regionId);
+        }
+        const res = await fetch(url);
+        const customers = await res.json();
+        const tbody = document.querySelector("#topRiskTable tbody");
+        tbody.innerHTML = "";
+        customers.forEach((c, idx) => {
+          const tr = document.createElement("tr");
+          tr.dataset.customerNo = c.customer_no;
+          tr.dataset.customerName = c.customer_name || "";
+          tr.innerHTML = `
+            <td>${idx + 1}</td>
+            <td>${c.customer_name}</td>
+            <td class="text-end">${fmtAmount(c.total_open)}</td>
+            <td class="text-end">${fmtAmount(c.overdue)}</td>
+            <td class="text-end">${fmtAmount(c.over90)}</td>
+            <td class="text-end">${fmtAmount(c.total_late_loss)}</td>
+            <td class="text-end">${fmtAmount(c.late_fee_unpaid ?? 0)}</td>
+            <td class="text-end">${c.unpaid_invoice_count ?? "-"}</td>
+            <td class="text-end">
+              <span class="badge ${riskColor(
+                c.risk_score
+              )}">${c.risk_score.toFixed(2)}</span>
+            </td>
+            <td>
+              <select class="form-select form-select-sm action-select">
+                <option value="">Aksiyon seçin</option>
+                <option value="sure">1 - Süre Talep Edildi</option>
+                <option value="vade_farki">2 - Vade Farkı Faturası Düzenlenmeli</option>
+                <option value="ihtar">3 - İhtarname Çekilmeli</option>
+                <option value="icra">4 - İcra Davası Açılmalı</option>
+                <option value="fesih">5 - Sözleşme Fesih Edilmeli</option>
+              </select>
+            </td>
+            <td>
+              <input
+                type="text"
+                class="form-control form-control-sm action-note"
+                placeholder="Toplantı notu"
+              />
+              <button type="button" class="btn btn-sm btn-primary mt-1 save-action-btn">
+                Kaydet
+              </button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+
+      async function loadDashboardSummary() {
+        const res = await fetch(API_BASE + "/dashboard");
+        const data = await res.json();
+        const el = document.getElementById("lateFeeUnpaidTotal");
+        el.innerText = fmtAmount(data.late_fee_unpaid_total);
+      }
+
+      async function loadRegionsFilter() {
+        const res = await fetch(API_BASE + "/regions/summary");
+        if (!res.ok) return;
+        const regions = await res.json();
+        const select = document.getElementById("regionFilter");
+        // Temizle, ilk seçenek olarak "Tüm Bölgeler" kalsın
+        select.innerHTML = '<option value="">Tüm Bölgeler</option>';
+        regions.forEach((r) => {
+          if (r.region_id === null || r.region_id === undefined) return;
+          const opt = document.createElement("option");
+          opt.value = r.region_id;
+          opt.textContent = r.region_name;
+          select.appendChild(opt);
+        });
+      }
+
+      async function loadAllCustomersList() {
+        const res = await fetch(API_BASE + "/customers");
+        if (!res.ok) return;
+        const customers = await res.json();
+        const select = document.getElementById("allCustomersSelect");
+        select.innerHTML = '<option value="">Müşteri seçin...</option>';
+        customers.forEach((c) => {
+          const opt = document.createElement("option");
+          opt.value = c.customer_no;
+          opt.textContent = `${c.customer_name || ""} (${c.customer_no})`;
+          opt.dataset.customerName = c.customer_name || "";
+          select.appendChild(opt);
+        });
+      }
+
+      async function loadExistingActions() {
+        // Tum aksiyonlari cekip musteri bazinda en guncel olanini kullan
+        const res = await fetch(API_BASE + "/actions");
+        if (!res.ok) return;
+        const actions = await res.json();
+        const latestByCustomer = {};
+        actions.forEach((a) => {
+          if (!a.customer_no) return;
+          if (!latestByCustomer[a.customer_no]) {
+            latestByCustomer[a.customer_no] = a;
+          }
+        });
+
+        const rows = document.querySelectorAll("#topRiskTable tbody tr");
+        rows.forEach((row) => {
+          const custNo = row.dataset.customerNo;
+          if (!custNo) return;
+          const a = latestByCustomer[custNo];
+          if (!a) return;
+          const select = row.querySelector(".action-select");
+          const noteInput = row.querySelector(".action-note");
+          if (select) select.value = a.action_type || "";
+          if (noteInput) noteInput.value = a.note || "";
+        });
+      }
+
+      async function init() {
+        await loadDashboardSummary();
+        await loadRegionsFilter();
+        await loadAllCustomersList();
+        await loadTopRisk(currentRegionId, currentSort);
+        await loadExistingActions();
+      }
+
+      // Delegated event listener for save buttons
+      document.addEventListener("click", (e) => {
+        const btn = e.target.closest(".save-action-btn");
+        if (!btn) return;
+        const row = btn.closest("tr");
+        if (!row) return;
+        saveActionForRow(row);
+      });
+
+      async function saveActionForRow(row) {
+        const customerNo = row.dataset.customerNo;
+        const customerName = row.dataset.customerName;
+        const select = row.querySelector(".action-select");
+        const noteInput = row.querySelector(".action-note");
+        const actionType = select?.value || "";
+        const note = noteInput?.value || "";
+
+        if (!customerNo || !actionType) {
+          alert("Müşteri ve aksiyon tipi zorunlu.");
+          return;
+        }
+
+        try {
+          const res = await fetch(API_BASE + "/actions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              customer_no: customerNo,
+              customer_name: customerName,
+              action_type: actionType,
+              note: note,
+            }),
+          });
+          if (!res.ok) {
+            throw new Error("HTTP " + res.status);
+          }
+          // Basarili kayitta satiri hafif yesil renkle isaretleyelim
+          row.classList.add("table-success");
+          setTimeout(() => row.classList.remove("table-success"), 1500);
+        } catch (err) {
+          console.error(err);
+          alert("Aksiyon kaydedilirken hata oluştu.");
+        }
+      }
+
+      // Bölge filtresi değişince listeyi yeniden yükle
+      document.getElementById("regionFilter").addEventListener("change", async (e) => {
+        currentRegionId = e.target.value || "";
+        await loadTopRisk(currentRegionId, currentSort);
+        await loadExistingActions();
+      });
+
+      // Sıralama filtresi değişince listeyi yeniden yükle
+      document.getElementById("sortFilter").addEventListener("change", async (e) => {
+        currentSort = e.target.value || "risk";
+        await loadTopRisk(currentRegionId, currentSort);
+        await loadExistingActions();
+      });
+
+      // Tum musteriler select'inden secim yapildiginda musteri detay sayfasina gec
+      document
+        .getElementById("allCustomersSelect")
+        .addEventListener("change", (e) => {
+          const customerNo = e.target.value;
+          if (!customerNo) return;
+          const selectedOption = e.target.selectedOptions[0];
+          const customerName =
+            selectedOption?.dataset.customerName || selectedOption.textContent;
+          const url =
+            "customer_detail.html?customer_no=" +
+            encodeURIComponent(customerNo) +
+            "&customer_name=" +
+            encodeURIComponent(customerName);
+          window.location.href = url;
+        });
+
+      init().catch((err) => {
+        console.error(err);
+        alert("Veriler yüklenirken hata oluştu.");
+      });
+    </script>
+  </body>
+</html>
+
+

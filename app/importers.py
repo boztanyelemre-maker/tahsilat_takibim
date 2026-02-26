@@ -280,7 +280,7 @@ def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
     Musteri-bolge eslemesini import eder.
 
     Beklenen kolonlar:
-      - Customer Number
+      - Customer Number  (veya alternatif olarak Customer Name)
       - Region Name
 
     Not: Region Name daha once yoksa regions tablosunda olusturulur,
@@ -290,11 +290,14 @@ def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
     df.columns = [str(c).strip() for c in df.columns]
 
     col_customer_no = "Customer Number"
+    col_customer_name = "Customer Name"
     col_region_name = "Region Name"
 
-    if col_customer_no not in df.columns or col_region_name not in df.columns:
-        # Kullaniciya daha anlamli hata icin exception firlatma yerine 0 donuyoruz,
-        # ama gercek kullanim icin HTTP katmaninda kontrol edilebilir.
+    # En azindan Region Name ve (Customer Number veya Customer Name) kolonlarindan
+    # biri olmali, yoksa hicbir sey yapma.
+    if col_region_name not in df.columns or (
+        col_customer_no not in df.columns and col_customer_name not in df.columns
+    ):
         return 0
 
     # Region cache
@@ -303,8 +306,19 @@ def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
     updated = 0
 
     for _, row in df.iterrows():
-        customer_no = _normalize_customer_no(row.get(col_customer_no))
-        if not customer_no:
+        # Hem Customer Number hem Customer Name'i destekle
+        customer_no = (
+            _normalize_customer_no(row.get(col_customer_no))
+            if col_customer_no in df.columns
+            else None
+        )
+        customer_name = (
+            str(row.get(col_customer_name) or "").strip()
+            if col_customer_name in df.columns
+            else ""
+        )
+        if not customer_no and not customer_name:
+            # Musteri referansi yoksa satiri atla
             continue
 
         region_name = str(row.get(col_region_name) or "").strip()
@@ -312,7 +326,18 @@ def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
             continue
 
         # Musteriyi bul
-        customer = db.query(Customer).filter(Customer.customer_no == customer_no).first()
+        if customer_no:
+            customer = (
+                db.query(Customer)
+                .filter(Customer.customer_no == customer_no)
+                .first()
+            )
+        else:
+            customer = (
+                db.query(Customer)
+                .filter(Customer.name == customer_name)
+                .first()
+            )
         if not customer:
             # Bu customer aging'de yoksa atla
             continue
