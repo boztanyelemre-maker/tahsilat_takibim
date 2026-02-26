@@ -1,0 +1,16 @@
+[build]
+  publish = "static"
+  command = "echo 'No build needed'"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[build.environment]
+  # Bu değeri Netlify Dashboard'dan ayarlayacaksın
+  # Settings > Environment variables > Add variable
+  # Key: API_BASE_URL
+  # Value: https://your-app-name.onrender.com
+
+
