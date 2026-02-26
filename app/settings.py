@@ -24,3 +24,4 @@ def set_cost_of_cash_annual(db: Session, value: float) -> None:
 
 
 
+

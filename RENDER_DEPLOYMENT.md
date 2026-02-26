@@ -102,3 +102,4 @@ Web Service oluşturulduktan sonra:
 - Database backup'ları otomatik alınır (free tier'da 7 gün)
 
 
+
