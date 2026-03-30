@@ -52,6 +52,8 @@ class Payment(Base):
     vade = Column(Integer)
     applied_amount = Column(Float)
     payment_amount_try = Column(Float)
+    # Excel'den gelen Finansal Kayip sütunu (toplam buradan hesaplanir)
+    financial_loss = Column(Float)
 
 
 class Setting(Base):

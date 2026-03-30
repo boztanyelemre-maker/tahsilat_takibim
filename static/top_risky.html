@@ -40,6 +40,15 @@
         padding-top: 0.45rem;
         padding-bottom: 0.45rem;
       }
+
+      .table-sticky-wrap {
+        max-height: calc(100vh - 200px);
+        overflow-y: auto;
+        overflow-x: auto;
+      }
+      #topRiskTable td {
+        white-space: nowrap;
+      }
     </style>
   </head>
   <body>
@@ -105,11 +114,8 @@
           <small class="text-muted">Varsayılan: İlk 50 müşteri</small>
         </div>
         <div class="card-body p-0">
-          <div class="table-responsive" style="max-height: calc(100vh - 140px);">
-            <table
-              class="table table-sm table-hover mb-0"
-              id="topRiskTable"
-            >
+          <div class="table-sticky-wrap">
+            <table class="table table-sm table-hover mb-0" id="topRiskTable">
               <thead class="table-light">
                 <tr>
                   <th>#</th>
@@ -138,9 +144,14 @@
       let currentRegionId = "";
       let currentSort = "risk";
 
+      function parseNum(val) {
+        if (val == null || val === "") return NaN;
+        let s = String(val).trim().replace(",", ".").replace(/[.\s]+$/, "");
+        const n = Number(s);
+        return isNaN(n) ? NaN : n;
+      }
       function fmtAmount(val) {
-        if (val == null) return "-";
-        const n = Number(val);
+        const n = parseNum(val);
         if (isNaN(n)) return "-";
         if (Math.abs(n) >= 1_000_000_000) {
           return (n / 1_000_000_000).toFixed(1) + " B";
@@ -149,14 +160,26 @@
           return (n / 1_000_000).toFixed(1) + " M";
         }
         return n.toLocaleString("tr-TR", {
-          maximumFractionDigits: 0,
+          minimumFractionDigits: 0,
+          maximumFractionDigits: 2,
         });
+      }
+      /** Tablo icin kisa, profesyonel format: B/M/K kisaltmalari */
+      function fmtAmountTable(val) {
+        const n = parseNum(val);
+        if (isNaN(n)) return "-";
+        const abs = Math.abs(n);
+        const sign = n < 0 ? "-" : "";
+        if (abs >= 1e9) return sign + (abs / 1e9).toLocaleString("tr-TR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + " B";
+        if (abs >= 1e6) return sign + (abs / 1e6).toLocaleString("tr-TR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + " M";
+        if (abs >= 1e3) return sign + (abs / 1e3).toLocaleString("tr-TR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + " K";
+        return n.toLocaleString("tr-TR", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
       }
 
       function riskColor(score) {
-        if (score >= 80) return "bg-danger";
-        if (score >= 60) return "bg-warning text-dark";
-        if (score >= 30) return "bg-info text-dark";
+        if (score > 50) return "bg-danger";
+        if (score >= 30) return "bg-warning text-dark";
+        if (score >= 10) return "bg-info text-dark";
         return "bg-success";
       }
 
@@ -179,17 +202,17 @@
           tr.dataset.customerName = c.customer_name || "";
           tr.innerHTML = `
             <td>${idx + 1}</td>
-            <td>${c.customer_name}</td>
-            <td class="text-end">${fmtAmount(c.total_open)}</td>
-            <td class="text-end">${fmtAmount(c.overdue)}</td>
-            <td class="text-end">${fmtAmount(c.over90)}</td>
-            <td class="text-end">${fmtAmount(c.total_late_loss)}</td>
-            <td class="text-end">${fmtAmount(c.late_fee_unpaid ?? 0)}</td>
+            <td>${(c.customer_name || "").trim() || "-"}</td>
+            <td class="text-end">${fmtAmountTable(c.total_open)}</td>
+            <td class="text-end">${fmtAmountTable(c.overdue)}</td>
+            <td class="text-end">${fmtAmountTable(c.over90)}</td>
+            <td class="text-end">${fmtAmountTable(c.total_late_loss)}</td>
+            <td class="text-end">${fmtAmountTable(c.late_fee_unpaid ?? 0)}</td>
             <td class="text-end">${c.unpaid_invoice_count ?? "-"}</td>
             <td class="text-end">
               <span class="badge ${riskColor(
-                c.risk_score
-              )}">${c.risk_score.toFixed(2)}</span>
+                c.risk_score ?? 0
+              )}">${(c.risk_score != null && !isNaN(Number(c.risk_score))) ? Number(c.risk_score).toFixed(2) : "-"}</span>
             </td>
             <td>
               <select class="form-select form-select-sm action-select">
@@ -226,7 +249,9 @@
       async function loadRegionsFilter() {
         const res = await fetch(API_BASE + "/regions/summary");
         if (!res.ok) return;
-        const regions = await res.json();
+        const data = await res.json();
+        const raw = data?.regions ?? data;
+        const regions = Array.isArray(raw) ? raw : (raw && typeof raw === "object" ? Object.values(raw) : []);
         const select = document.getElementById("regionFilter");
         // Temizle, ilk seçenek olarak "Tüm Bölgeler" kalsın
         select.innerHTML = '<option value="">Tüm Bölgeler</option>';

@@ -7,7 +7,9 @@ import unicodedata
 import re
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from pathlib import Path
+
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -19,6 +21,13 @@ from .importers import (
     import_payments_df,
 )
 from .metrics import calculate_late_loss_payment
+
+
+def _get_payment_loss(payment: Payment, cost_of_cash: float) -> float:
+    """Excel'deki Finansal Kayip sütunu varsa onu kullan, yoksa hesapla."""
+    if payment.financial_loss is not None:
+        return payment.financial_loss
+    return calculate_late_loss_payment(payment, cost_of_cash)
 from .models import Action, Customer, Invoice, Payment, Region, Setting
 from .risk_score import calculate_risk_score
 from .schemas import ActionCreate, ActionOut, SettingsUpdate
@@ -61,6 +70,10 @@ with engine.connect() as conn:
         pass
     try:
         conn.execute(text("ALTER TABLE payments ADD COLUMN payment_date DATE"))
+    except Exception:
+        pass
+    try:
+        conn.execute(text("ALTER TABLE payments ADD COLUMN financial_loss FLOAT"))
     except Exception:
         pass
 
@@ -113,12 +126,60 @@ def _sanitize_filename(name: str) -> str:
 
 
 # Statik frontend (Meeting Mode) icin
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Proje kokune gore mutlak yol: uvicorn baska cwd ile baslasa bile /static 404 olmasin
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+# index.html cache'siz servis edilir (her yenilemede guncel sayfa)
+NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
+
+@app.get("/static/index.html")
+async def serve_index_html():
+    """index.html her zaman cache'siz - guncel veri icin."""
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html", headers=NO_CACHE_HEADERS)
+
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+def root():
+    """Ana sayfaya yonlendir."""
+    return RedirectResponse(url="/static/index.html")
 
 
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "ALACAK360 backend calisiyor"}
+
+
+@app.get("/debug/db-stats")
+def debug_db_stats(db: Session = Depends(get_db)):
+    """Veritabanindaki ham veriyi gosterir - guncel veri kontrolu icin."""
+    from .db import DATABASE_URL
+    invoices = db.query(Invoice).all()
+    payments = db.query(Payment).all()
+    total_open_all = sum(i.open_balance or 0 for i in invoices)
+    total_open_try = sum(i.open_balance or 0 for i in invoices if (i.currency or "").upper() in ("TRY", "TL", "TRL"))
+    _proj = Path(__file__).resolve().parent.parent
+    _sqlite_default = _proj / "tahsilat.db"
+    url = DATABASE_URL or ""
+    uses_sqlite = "sqlite" in url.lower()
+    uses_pg = "postgresql" in url
+    return {
+        "database": "postgresql" if uses_pg else "sqlite",
+        "active_sqlite_path": str(_sqlite_default) if uses_sqlite else None,
+        "tahsilat_db_note": (
+            "Bu calisma PostgreSQL kullaniyor; proje klasorundeki tahsilat.db dosyasi yazilmaz. "
+            "SQLite istiyorsaniz .env / .env.txt icinden DATABASE_URL satirini kaldirin veya yorum yapin."
+            if uses_pg
+            else None
+        ),
+        "invoice_count": len(invoices),
+        "payment_count": len(payments),
+        "total_open_all": total_open_all,
+        "total_open_try": total_open_try,
+        "currencies": list(set((i.currency or "N/A") for i in invoices)),
+    }
 
 
 @app.get("/dashboard")
@@ -127,8 +188,10 @@ def dashboard(db: Session = Depends(get_db)):
 
     invoices = db.query(Invoice).all()
     payments = db.query(Payment).all()
+    invoice_count = len(invoices)
 
     total_open = sum(i.open_balance or 0 for i in invoices)
+    customer_count = len({i.customer_no for i in invoices if (i.open_balance or 0) > 0})
     overdue = sum(
         i.open_balance or 0
         for i in invoices
@@ -142,11 +205,20 @@ def dashboard(db: Session = Depends(get_db)):
     )
 
     # Para birimi bazinda ozet (Toplam Açık, Vadesi Geçmiş ve 90+ icin)
+    # TL, TRY, ₺ ayni para birimi olarak birlestir
+    def _norm_currency(c: str | None) -> str:
+        if not c:
+            return "N/A"
+        c = str(c).strip().upper()
+        if c in ("TL", "TRY", "TRL") or c == "₺":
+            return "TRY"
+        return c or "N/A"
+
     totals_by_currency: Dict[str, Dict[str, float]] = {}
     overdue_by_currency: Dict[str, Dict[str, float]] = {}
     over90_by_currency: Dict[str, Dict[str, float]] = {}
     for inv in invoices:
-        cur = inv.currency or "N/A"
+        cur = _norm_currency(inv.currency)
         bucket = totals_by_currency.setdefault(cur, {"total_open": 0.0})
         bucket["total_open"] += inv.open_balance or 0.0
         if inv.due_date is not None and inv.due_date < today:
@@ -159,26 +231,40 @@ def dashboard(db: Session = Depends(get_db)):
                 o90_bucket = over90_by_currency.setdefault(cur, {"over90": 0.0})
                 o90_bucket["over90"] += ob
 
-    # Settings: cost_of_cash ve late_fee_rate (yillik %)
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
-    late_fee_rate = get_late_fee_rate_annual(db, default=36.0)
+    # Ana toplam: tum para birimleri (bolgeler tablosu ile tutarli)
+    total_open_all = sum(v["total_open"] for v in totals_by_currency.values())
+    total_open_try = totals_by_currency.get("TRY", {}).get("total_open", 0.0)
+    overdue_all = sum(v["overdue"] for v in overdue_by_currency.values())
+    overdue_try = overdue_by_currency.get("TRY", {}).get("overdue", 0.0)
+    over90_all = sum(v["over90"] for v in over90_by_currency.values())
+    over90_try = over90_by_currency.get("TRY", {}).get("over90", 0.0)
 
-    # Son 30 gunde tum odemeler icin gec odeme kaybi (delay_days <= 0 olan satirlar fonksiyonda zaten 0 donecek)
+    # Settings: cost_of_cash ve late_fee_rate (yillik %)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
+    late_fee_rate = get_late_fee_rate_annual(db, default=53.13)
+
+    # Finansal kayip: Excel'deki "Finansal Kayip" sütunu toplami; yoksa hesaplanan deger
     last_30 = today - timedelta(days=30)
     pay_rows_30 = [p for p in payments if p.value_date is not None and p.value_date >= last_30]
-    loss_30 = sum(calculate_late_loss_payment(p, cost_of_cash) for p in pay_rows_30)
+    loss_30 = sum(_get_payment_loss(p, cost_of_cash) for p in pay_rows_30)
     loss_30_rows = len(pay_rows_30)
-
-    # Toplam (tarihten bagimsiz) tum odemeler icin gec odeme kaybi
-    total_late_loss = sum(calculate_late_loss_payment(p, cost_of_cash) for p in payments)
+    total_late_loss = sum(_get_payment_loss(p, cost_of_cash) for p in payments)
     total_late_loss_rows = len(payments)
 
     # Odenmemis faturalar icin GUNCEL vade farki (tahakkuk) hesaplama
+    # Sadece TRY faturalar (oran TRY icin gecerli; EUR/USD farkli oran kullanir)
     # late_fee = open_balance * days_overdue * (late_fee_rate_annual / 100 / 365)
+    def _is_try(c: str | None) -> bool:
+        if not c:
+            return False
+        return str(c).strip().upper() in ("TRY", "TL", "TRL") or c == "₺"
+
     daily_late_fee_rate = (late_fee_rate / 100.0) / 365.0
     total_late_fee_unpaid = 0.0
     for inv in invoices:
         if inv.open_balance is None or inv.open_balance <= 0:
+            continue
+        if not _is_try(inv.currency):
             continue
         if inv.due_date is None or inv.due_date >= today:
             continue
@@ -187,12 +273,13 @@ def dashboard(db: Session = Depends(get_db)):
             continue
         total_late_fee_unpaid += inv.open_balance * days_overdue * daily_late_fee_rate
 
-    overdue_ratio = overdue / total_open if total_open else 0.0
-    over90_ratio = over90 / overdue if overdue else 0.0
+    # Risk hesaplamasi tum para birimleri uzerinden (bolgeler tablosu ile tutarli)
+    overdue_ratio = overdue_all / total_open_all if total_open_all else 0.0
+    over90_ratio = over90_all / overdue_all if overdue_all else 0.0
 
     # MVP: weighted_days'i basit tutuyoruz, istersek sonraki adimda detaylandiririz
     weighted_days = 0.0
-    loss_ratio = loss_30 / total_open if total_open else 0.0
+    loss_ratio = loss_30 / total_open_all if total_open_all else 0.0
 
     risk = calculate_risk_score(
         overdue_ratio=overdue_ratio,
@@ -201,10 +288,13 @@ def dashboard(db: Session = Depends(get_db)):
         loss_ratio=loss_ratio,
     )
 
-    return {
-        "total_open": total_open,
-        "overdue": overdue,
-        "over90": over90,
+    content = {
+        "total_open": total_open_all,
+        "total_open_try": total_open_try,
+        "invoice_count": invoice_count,
+        "customer_count": customer_count,
+        "overdue": overdue_all,
+        "over90": over90_all,
         "loss_30d": loss_30,
         "loss_30d_rows": loss_30_rows,
         "total_late_loss": total_late_loss,
@@ -226,6 +316,10 @@ def dashboard(db: Session = Depends(get_db)):
             for cur, vals in over90_by_currency.items()
         ],
     }
+    return JSONResponse(
+        content=content,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @app.post("/import/invoices")
@@ -259,7 +353,15 @@ async def import_invoices(file: UploadFile = File(...), db: Session = Depends(ge
         raise HTTPException(status_code=400, detail=f"Dosya okunamadi: {exc}") from exc
 
     imported = import_invoices_df(db, df)
-    return {"rows": int(len(df)), "inserted_or_updated": imported}
+    db.commit()
+    from .db import DATABASE_URL
+    db_name = "tahsilat.db" if (DATABASE_URL or "").startswith("sqlite") else "veritabani"
+    return {
+        "rows": int(len(df)),
+        "inserted_or_updated": imported,
+        "database_updated": True,
+        "message": f"{db_name} guncellendi",
+    }
 
 
 @app.post("/import/payments")
@@ -273,14 +375,16 @@ async def import_payments(file: UploadFile = File(...), db: Session = Depends(ge
 
     try:
         if suffix.endswith((".xlsx", ".xls", ".xlsm")):
-            # Ozel olarak "data" sayfasini oku
-            try:
-                df = pd.read_excel(file.file, sheet_name="data")
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail='Excel icinde "data" isimli sayfa bulunamadi.',
-                ) from exc
+            # "data" sayfasi yoksa "ham_data", "Sheet1" veya ilk sayfayi dene
+            file.file.seek(0)
+            xl = pd.ExcelFile(file.file)
+            sheet_names = xl.sheet_names
+            for name in ("data", "ham_data", "Sheet1", "Finansal Kayıp"):
+                if name in sheet_names:
+                    df = pd.read_excel(xl, sheet_name=name)
+                    break
+            else:
+                df = pd.read_excel(xl, sheet_name=0)
         elif suffix.endswith(".csv"):
             df = pd.read_csv(file.file)
         else:
@@ -292,7 +396,15 @@ async def import_payments(file: UploadFile = File(...), db: Session = Depends(ge
         raise HTTPException(status_code=400, detail=f"Dosya okunamadi: {exc}") from exc
 
     imported = import_payments_df(db, df)
-    return {"rows": int(len(df)), "inserted": imported}
+    db.commit()
+    from .db import DATABASE_URL
+    db_name = "tahsilat.db" if (DATABASE_URL or "").startswith("sqlite") else "veritabani"
+    return {
+        "rows": int(len(df)),
+        "inserted": imported,
+        "database_updated": True,
+        "message": f"{db_name} guncellendi",
+    }
 
 
 def _customer_metrics(
@@ -355,18 +467,16 @@ def _customer_metrics(
     # Son 30 gunde tum odemeler icin gec odeme kaybi
     last_30 = today - timedelta(days=30)
     loss_30 = sum(
-        calculate_late_loss_payment(p, cost_of_cash)
+        _get_payment_loss(p, cost_of_cash)
         for p in payments
         if p.value_date is not None and p.value_date >= last_30
     )
 
-    # Musteri bazinda toplam finansal kayip (tarihten bagimsiz)
-    total_late_loss_customer = sum(
-        calculate_late_loss_payment(p, cost_of_cash) for p in payments
-    )
+    # Musteri bazinda toplam finansal kayip (Excel sütunu veya hesaplanan)
+    total_late_loss_customer = sum(_get_payment_loss(p, cost_of_cash) for p in payments)
 
     # Odenmemis faturalar icin musterinin GUNCEL vade farki (tahakkuk) tutari
-    late_fee_rate = get_late_fee_rate_annual(db, default=36.0)
+    late_fee_rate = get_late_fee_rate_annual(db, default=53.13)
     daily_late_fee_rate = (late_fee_rate / 100.0) / 365.0
     late_fee_unpaid = 0.0
     for inv in unpaid_invoices:
@@ -420,7 +530,7 @@ def top_risky_customers(
       - "loss": toplam finansal kayip (total_late_loss) gore azalan
     """
     today = date.today()
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
     query = db.query(Customer)
     if region_id is not None:
@@ -442,40 +552,37 @@ def top_risky_customers(
         m["region_id"] = c.region_id
         raw_results.append(m)
 
-    # sort_by == "loss" icin ayni musteriyi (isim bazli) tek satira indir ve
-    # finansal kayiplarini toplama yontemiyle birlestir.
-    if sort_by == "loss":
-        grouped: Dict[str, Dict] = {}
-        for m in raw_results:
-            key = m.get("customer_name") or m.get("customer_no")
-            if key not in grouped:
-                grouped[key] = dict(m)
-            else:
-                g = grouped[key]
-                # Tutarlar icin toplama
-                g["total_open"] += m["total_open"]
-                g["overdue"] += m["overdue"]
-                g["over90"] += m["over90"]
-                g["loss_30d"] += m["loss_30d"]
-                g["total_late_loss"] += m["total_late_loss"]
-                g["unpaid_invoice_count"] += m["unpaid_invoice_count"]
-                g["late_fee_unpaid"] += m.get("late_fee_unpaid", 0.0)
-                # Risk skorunu kabaca en yuksek degerle temsil et
-                if m["risk_score"] > g["risk_score"]:
-                    g["risk_score"] = m["risk_score"]
-        results = list(grouped.values())
+    # Ayni musteriyi (isim bazli) tek satira indir - farkli customer_no formatlari
+    # (1389 vs 1389.0) ayni firmayi gosterdigi icin birlestir
+    grouped: Dict[str, Dict] = {}
+    for m in raw_results:
+        key = (m.get("customer_name") or m.get("customer_no") or "").strip()
+        if not key:
+            key = str(m.get("customer_no", ""))
+        if key not in grouped:
+            grouped[key] = dict(m)
+        else:
+            g = grouped[key]
+            g["total_open"] += m["total_open"]
+            g["overdue"] += m["overdue"]
+            g["over90"] += m["over90"]
+            # loss_30d ve total_late_loss: odemeler customer_name ile eslendigi icin
+            # ayni isimdeki musteriler (1389 vs 1389.0) ayni odemeleri alir - toplama, max al
+            g["loss_30d"] = max(g["loss_30d"], m["loss_30d"])
+            g["total_late_loss"] = max(g["total_late_loss"], m["total_late_loss"])
+            g["unpaid_invoice_count"] += m["unpaid_invoice_count"]
+            g["late_fee_unpaid"] += m.get("late_fee_unpaid", 0.0)
+            if m["risk_score"] > g["risk_score"]:
+                g["risk_score"] = m["risk_score"]
+    results = list(grouped.values())
+    if sort_by == "overdue":
+        results.sort(key=lambda x: x["overdue"], reverse=True)
+    elif sort_by == "unpaid":
+        results.sort(key=lambda x: x["unpaid_invoice_count"], reverse=True)
+    elif sort_by == "loss":
         results.sort(key=lambda x: x["total_late_loss"], reverse=True)
     else:
-        # Diger siralama kriterleri icin customer_no bazli listeyi kullan
-        results = list(raw_results)
-        if sort_by == "overdue":
-            results.sort(key=lambda x: x["overdue"], reverse=True)
-        elif sort_by == "unpaid":
-            results.sort(key=lambda x: x["unpaid_invoice_count"], reverse=True)
-        else:
-            # Varsayilan: risk skoru
-            results.sort(key=lambda x: x["risk_score"], reverse=True)
-
+        results.sort(key=lambda x: x["risk_score"], reverse=True)
     return results[: max(1, limit)]
 
 
@@ -505,22 +612,37 @@ def top_unpaid_customers(
     Odenmemis fatura adedi en yuksek musteriler.
     """
     today = date.today()
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
     query = db.query(Customer)
     if region_id is not None:
         query = query.filter(Customer.region_id == region_id)
 
     customers = query.all()
-    results: List[Dict] = []
+    raw: List[Dict] = []
     for c in customers:
         m = _customer_metrics(db, c.customer_no, cost_of_cash, today)
         if m["unpaid_invoice_count"] <= 0:
             continue
         m["customer_name"] = c.name
         m["region_id"] = c.region_id
-        results.append(m)
-
+        raw.append(m)
+    # Ayni musteri (isim bazli) tek satira indir
+    grouped: Dict[str, Dict] = {}
+    for m in raw:
+        key = (m.get("customer_name") or m.get("customer_no") or "").strip() or str(m.get("customer_no", ""))
+        if key not in grouped:
+            grouped[key] = dict(m)
+        else:
+            g = grouped[key]
+            g["total_open"] += m["total_open"]
+            g["overdue"] += m["overdue"]
+            g["over90"] += m["over90"]
+            g["unpaid_invoice_count"] += m["unpaid_invoice_count"]
+            g["total_late_loss"] = max(g["total_late_loss"], m["total_late_loss"])
+            if m["risk_score"] > g["risk_score"]:
+                g["risk_score"] = m["risk_score"]
+    results = list(grouped.values())
     results.sort(key=lambda x: x["unpaid_invoice_count"], reverse=True)
     return results[: max(1, limit)]
 
@@ -535,7 +657,7 @@ def customer_summary(customer_no: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Musteri bulunamadi")
 
     today = date.today()
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
     metrics = _customer_metrics(db, customer_no, cost_of_cash, today)
     metrics["customer_name"] = customer.name
     metrics["region_id"] = customer.region_id
@@ -550,7 +672,7 @@ def regions_summary(db: Session = Depends(get_db)):
     region_id bos olan musteriler "Unknown" grubunda toplanir.
     """
     today = date.today()
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
     customers = db.query(Customer).all()
     invoices = db.query(Invoice).all()
@@ -575,6 +697,7 @@ def regions_summary(db: Session = Depends(get_db)):
                 "weighted_num": 0.0,
                 "weighted_den": 0.0,
                 "loss_30d": 0.0,
+                "customer_nos": set(),
             }
         return region_totals[rid]
 
@@ -583,6 +706,8 @@ def regions_summary(db: Session = Depends(get_db)):
         rid = customer_region.get(inv.customer_no, -1)
         bucket = ensure_region(rid)
         ob = inv.open_balance or 0.0
+        if ob > 0:
+            bucket["customer_nos"].add(inv.customer_no)
         bucket["total_open"] += ob
         if inv.due_date is not None and inv.due_date < today:
             bucket["overdue"] += ob
@@ -601,7 +726,7 @@ def regions_summary(db: Session = Depends(get_db)):
         if p.value_date is None or p.value_date < last_30:
             continue
         bucket = ensure_region(rid)
-        bucket["loss_30d"] += calculate_late_loss_payment(p, cost_of_cash)
+        bucket["loss_30d"] += _get_payment_loss(p, cost_of_cash)
 
     # Region isimleri
     regions = db.query(Region).all()
@@ -633,6 +758,7 @@ def regions_summary(db: Session = Depends(get_db)):
             {
                 "region_id": None if rid == -1 else rid,
                 "region_name": region_names.get(rid, "Unknown"),
+                "customer_count": len(agg.get("customer_nos", set())),
                 "total_open": total_open,
                 "overdue": overdue,
                 "over90": over90,
@@ -644,17 +770,34 @@ def regions_summary(db: Session = Depends(get_db)):
 
     # Risk skoruna gore sirala (azalan)
     result_list.sort(key=lambda x: x["risk_score"], reverse=True)
-    return result_list
+
+    # Unknown uyari: sadece acik bakiyesi olan bolgesiz musteriler
+    customers_with_open = {inv.customer_no for inv in invoices if (inv.open_balance or 0) > 0}
+    unknown_customers = [
+        {"customer_no": c.customer_no, "customer_name": c.name}
+        for c in customers
+        if c.region_id is None and c.customer_no in customers_with_open
+    ]
+    unknown_customer_count = len(unknown_customers)
+    unknown_total_open = region_totals.get(-1, {}).get("total_open", 0.0)
+    has_unknown_regions = unknown_customer_count > 0 and unknown_total_open > 0
+
+    return {
+        "regions": result_list,
+        "has_unknown_regions": has_unknown_regions,
+        "unknown_customer_count": unknown_customer_count,
+        "unknown_customers": unknown_customers,
+    }
 
 
 @app.post("/import/customer-regions")
 async def import_customer_regions(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
-    Musteri-bolge eslesmesi icin Excel/CSV import.
+    Musteri-bolge eslesmesi icin Excel import (bolge_adlari.xlsx).
 
-    Beklenen sayfa ve kolonlar:
-      - Tek sayfa veya secili sayfa (varsayilan ilk sayfa)
-      - Kolon adlari: "Customer Number", "Region Name"
+    Beklenen kolonlar:
+      - Customer Name: musteriyi eslestir
+      - Region Name: bolge atamasi
     """
     filename = file.filename or ""
     suffix = filename.lower()
@@ -691,7 +834,7 @@ def region_customers(
         raise HTTPException(status_code=404, detail="Bolge bulunamadi")
 
     today = date.today()
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
     customers = db.query(Customer).filter(Customer.region_id == region_id).all()
     results: List[Dict] = []
@@ -750,7 +893,7 @@ def customer_late_payments(customer_no: str, db: Session = Depends(get_db)):
     """
     Musterinin gec odemeleri (delay_days > 0 olan payments satirlari).
     """
-    cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+    cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
     # Customer_no ile kayitli musteri adini bul, varsa payments'i isim uzerinden filtrele
     customer = db.query(Customer).filter(Customer.customer_no == customer_no).first()
@@ -761,7 +904,7 @@ def customer_late_payments(customer_no: str, db: Session = Depends(get_db)):
 
     result = []
     for p in payments:
-        loss = calculate_late_loss_payment(p, cost_of_cash)
+        loss = _get_payment_loss(p, cost_of_cash)
         result.append(
             {
                 "payment_id": p.id,
@@ -788,7 +931,7 @@ def customer_financial_loss_export(customer_no: str, db: Session = Depends(get_d
         if not customer:
             raise HTTPException(status_code=404, detail="Musteri bulunamadi")
 
-        cost_of_cash = get_cost_of_cash_annual(db, default=45.0)
+        cost_of_cash = get_cost_of_cash_annual(db, default=49.0)
 
         # Payments satirlarini al (customer_name ile eslestir)
         if customer.name:
@@ -821,8 +964,8 @@ def customer_financial_loss_export(customer_no: str, db: Session = Depends(get_d
             # ADAT (Average Daily Amount of Time)
             adat = delay_days * applied_amount if delay_days > 0 else 0.0
 
-            # Finansal kayip
-            loss = calculate_late_loss_payment(p, cost_of_cash)
+            # Finansal kayip: Excel sütunu varsa onu, yoksa hesaplanan
+            loss = _get_payment_loss(p, cost_of_cash)
 
             rows.append(
                 {
@@ -870,29 +1013,37 @@ def customer_financial_loss_export(customer_no: str, db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=f"Excel export hatasi: {e!r}")
 
 
-@app.get("/settings")
+@app.get("/settings", tags=["Ayarlar"])
 def get_settings(db: Session = Depends(get_db)):
     """
-    Sistem parametreleri (su an icin cost_of_cash_annual ve late_fee_rate_annual).
+    Güncel sistem parametreleri: Cost of Cash ve **vade farkı (yıllık %)**.
     """
-    cost_of_cash_value = get_cost_of_cash_annual(db, default=45.0)
-    late_fee_value = get_late_fee_rate_annual(db, default=36.0)
+    cost_of_cash_value = get_cost_of_cash_annual(db, default=49.0)
+    late_fee_value = get_late_fee_rate_annual(db, default=53.13)
     return {
         "cost_of_cash_annual": cost_of_cash_value,
         "late_fee_rate_annual": late_fee_value,
     }
 
 
-@app.put("/settings")
+@app.put("/settings", tags=["Ayarlar"])
 def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     """
-    Sistem parametrelerini gunceller (cost_of_cash_annual ve late_fee_rate_annual).
+    Parametreleri günceller. **Sadece vade farkı oranını** değiştirmek için gövdeye yalnızca
+    `late_fee_rate_annual` yazmanız yeterli (ör. `{"late_fee_rate_annual": 53.13}`).
     """
-    set_cost_of_cash_annual(db, payload.cost_of_cash_annual)
-    set_late_fee_rate_annual(db, payload.late_fee_rate_annual)
+    if payload.cost_of_cash_annual is None and payload.late_fee_rate_annual is None:
+        raise HTTPException(
+            status_code=400,
+            detail="En az bir alan gönderin: cost_of_cash_annual ve/veya late_fee_rate_annual",
+        )
+    if payload.cost_of_cash_annual is not None:
+        set_cost_of_cash_annual(db, payload.cost_of_cash_annual)
+    if payload.late_fee_rate_annual is not None:
+        set_late_fee_rate_annual(db, payload.late_fee_rate_annual)
     return {
-        "cost_of_cash_annual": payload.cost_of_cash_annual,
-        "late_fee_rate_annual": payload.late_fee_rate_annual,
+        "cost_of_cash_annual": get_cost_of_cash_annual(db, default=49.0),
+        "late_fee_rate_annual": get_late_fee_rate_annual(db, default=53.13),
     }
 
 

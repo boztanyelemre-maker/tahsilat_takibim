@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+import unicodedata
+from typing import Dict, List, Optional
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -9,15 +10,22 @@ from .models import Customer, Invoice, Payment, Region
 
 
 def _to_float(value: object) -> Optional[float]:
+    """Türkçe (423.190.238,19) ve ABD (423,190,238.19) formatlarini destekler."""
     try:
         if value is None:
             return None
         if isinstance(value, (int, float)):
             return float(value)
         text = str(value).strip()
-        if not text:
+        if not text or text.lower() == "nan":
             return None
-        return float(text.replace(".", "").replace(",", ".")) if "," in text and text.count(",") == 1 else float(text)
+        # Virgül varsa: Türkçe format (423.190.238,19) - nokta binlik, virgül ondalik
+        if "," in text and text.count(",") == 1:
+            text = text.replace(".", "").replace(",", ".")
+        # Virgül yok, birden fazla nokta: Türkçe binlik (423.190.238)
+        elif text.count(".") > 1:
+            text = text.replace(".", "")
+        return float(text)
     except Exception:
         return None
 
@@ -37,6 +45,7 @@ def _to_int(value: object) -> Optional[int]:
 def _normalize_customer_no(value: object) -> Optional[str]:
     """
     Müşteri numarasını stringe çevirir, bos veya 'nan' ise None döner.
+    Excel'den 825064.0 gelen sayilari 825064 yapar.
     """
     if value is None:
         return None
@@ -45,6 +54,14 @@ def _normalize_customer_no(value: object) -> Optional[str]:
         return None
     if text.lower() == "nan":
         return None
+    # 825064.0 -> 825064 (tam sayi ise .0 kaldir)
+    if "." in text:
+        try:
+            f = float(text)
+            if f == int(f):
+                return str(int(f))
+        except ValueError:
+            pass
     return text
 
 
@@ -67,9 +84,22 @@ def import_invoices_df(db: Session, df: pd.DataFrame) -> int:
     col_customer_name = "Customer Name"
     col_invoice_date = "Date"
     col_due_date = "Due Date"
-    col_currency = "Invoice Currency Code"
     col_total_amount = "Total Amount"
-    col_open_balance = "Open Balance"
+
+    # Alternatif kolon adlari (Excel farkli isim kullanabilir)
+    def _find_col(primary: str, alternatives: list) -> str:
+        if primary in df.columns:
+            return primary
+        for alt in alternatives:
+            if alt in df.columns:
+                return alt
+        return primary
+
+    col_open_balance = _find_col("Open Balance", ["Açık Bakiye", "OpenBalance", "Open_Balance"])
+    col_currency = _find_col("Invoice Currency Code", ["Currency", "Para Birimi", "Invoice Currency"])
+
+    # Her import tam yenileme: eski faturalari sil, Excel'deki guncel veriyi yukle
+    db.query(Invoice).delete()
 
     # Tarih kolonlarini date tipine cevir
     for col in (col_invoice_date, col_due_date):
@@ -103,8 +133,6 @@ def import_invoices_df(db: Session, df: pd.DataFrame) -> int:
             if customer_name and customer.name != customer_name:
                 customer.name = customer_name
 
-        invoice = db.query(Invoice).filter(Invoice.invoice_no == invoice_no).first()
-
         invoice_date = row.get(col_invoice_date)
         due_date = row.get(col_due_date)
         vade_days: Optional[int] = None
@@ -117,17 +145,7 @@ def import_invoices_df(db: Session, df: pd.DataFrame) -> int:
         total_amount = _to_float(row.get(col_total_amount))
         open_balance = _to_float(row.get(col_open_balance))
 
-        if invoice:
-            invoice.customer_no = customer_no
-            invoice.customer_name = customer_name or customer.name
-            invoice.invoice_date = invoice_date
-            invoice.due_date = due_date
-            invoice.vade = vade_days
-            invoice.currency = currency
-            invoice.total_amount = total_amount
-            invoice.open_balance = open_balance
-        else:
-            invoice = Invoice(
+        invoice = Invoice(
                 invoice_no=invoice_no,
                 customer_no=customer_no,
                 customer_name=customer_name or customer.name,
@@ -138,8 +156,8 @@ def import_invoices_df(db: Session, df: pd.DataFrame) -> int:
                 total_amount=total_amount,
                 open_balance=open_balance,
             )
-            db.add(invoice)
-            imported += 1
+        db.add(invoice)
+        imported += 1
 
     db.commit()
     return imported
@@ -169,7 +187,18 @@ def import_payments_df(db: Session, df: pd.DataFrame) -> int:
     col_invoice_date_pay = "Fatura Tarihi"
     col_applied_amount = "Uygulanan Tutar"
     col_payment_try = "Ödeme Tutar TRY"
-    
+
+    # Alternatif kolon adlari
+    def _find_col_pay(primary: str, alternatives: list) -> str:
+        if primary in df.columns:
+            return primary
+        for alt in alternatives:
+            if alt in df.columns:
+                return alt
+        return primary
+
+    col_financial_loss = _find_col_pay("Finansal Kayıp", ["Finansal Kayip", "FinansalKayip", "Financial Loss"])
+
     # Kolon kontrolü: "Uygulanan Tutar" kolonu yoksa uyari ver
     if col_applied_amount not in df.columns:
         # Alternatif kolon adlarini dene
@@ -255,6 +284,7 @@ def import_payments_df(db: Session, df: pd.DataFrame) -> int:
                 customer_vade_cache[customer_name] = vade_days_for_payment
         applied_amount = _to_float(row.get(col_applied_amount))
         payment_amount_try = _to_float(row.get(col_payment_try))
+        financial_loss = _to_float(row.get(col_financial_loss)) if col_financial_loss in df.columns else None
 
         payment = Payment(
             customer_no=customer_no,
@@ -267,6 +297,7 @@ def import_payments_df(db: Session, df: pd.DataFrame) -> int:
             vade=vade_days_for_payment,
             applied_amount=applied_amount,
             payment_amount_try=payment_amount_try,
+            financial_loss=financial_loss,
         )
         db.add(payment)
         imported += 1
@@ -277,69 +308,65 @@ def import_payments_df(db: Session, df: pd.DataFrame) -> int:
 
 def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
     """
-    Musteri-bolge eslemesini import eder.
+    Musteri-bolge eslemesini import eder (bolge_adlari.xlsx).
 
     Beklenen kolonlar:
-      - Customer Number  (veya alternatif olarak Customer Name)
-      - Region Name
+      - Customer Name: musteriyi eslestir (Müşteri Adı, Unvan, Firma vb. alternatifler)
+      - Region Name: bolge atamasi (Bölge Adı, Bölge vb. alternatifler)
 
-    Not: Region Name daha once yoksa regions tablosunda olusturulur,
-    ilgili musterinin region_id alanina baglanir.
+    Musteri Customer Name ile eslesir, Region Name bolge olarak eklenir.
     """
     # Basliklari normalize et
     df.columns = [str(c).strip() for c in df.columns]
 
-    col_customer_no = "Customer Number"
-    col_customer_name = "Customer Name"
-    col_region_name = "Region Name"
+    # Alternatif kolon adlari
+    def _find_col_reg(primary: str, alts: list) -> str:
+        if primary in df.columns:
+            return primary
+        for a in alts:
+            if a in df.columns:
+                return a
+        return primary
 
-    # En azindan Region Name ve (Customer Number veya Customer Name) kolonlarindan
-    # biri olmali, yoksa hicbir sey yapma.
-    if col_region_name not in df.columns or (
-        col_customer_no not in df.columns and col_customer_name not in df.columns
-    ):
+    col_customer_name = _find_col_reg("Customer Name", ["Müşteri Adı", "Müşteri Adi", "CustomerName", "Unvan", "Firma Adı", "Firma"])
+    col_region_name = _find_col_reg("Region Name", ["Bölge Adı", "Bolge Adi", "RegionName", "Bölge", "Bolge"])
+
+    # Customer Name ve Region Name zorunlu (bolge_adlari.xlsx)
+    if col_customer_name not in df.columns or col_region_name not in df.columns:
         return 0
 
     # Region cache
     regions_cache: Dict[str, Region] = {}
 
+    # Tum musterileri Python'da normalize ederek eslestir (SQLite LOWER Turkce desteklemez)
+    # NFC: I+combining_dot -> I, farkli Unicode gosterimlerini birlestirir
+    def _norm(s: str) -> str:
+        s = " ".join(str(s or "").split()).strip()
+        s = unicodedata.normalize("NFC", s)
+        return s.lower()
+
+    all_customers = db.query(Customer).all()
+    # Ayni isimde birden fazla musteri olabilir (farkli customer_no formatlari)
+    by_norm: Dict[str, List[Customer]] = {}
+    for c in all_customers:
+        n = _norm(c.name)
+        if n:
+            by_norm.setdefault(n, []).append(c)
+
     updated = 0
 
     for _, row in df.iterrows():
-        # Hem Customer Number hem Customer Name'i destekle
-        customer_no = (
-            _normalize_customer_no(row.get(col_customer_no))
-            if col_customer_no in df.columns
-            else None
-        )
-        customer_name = (
-            str(row.get(col_customer_name) or "").strip()
-            if col_customer_name in df.columns
-            else ""
-        )
-        if not customer_no and not customer_name:
-            # Musteri referansi yoksa satiri atla
+        customer_name = " ".join(str(row.get(col_customer_name) or "").split())
+        if not customer_name:
             continue
 
         region_name = str(row.get(col_region_name) or "").strip()
         if not region_name:
             continue
 
-        # Musteriyi bul
-        if customer_no:
-            customer = (
-                db.query(Customer)
-                .filter(Customer.customer_no == customer_no)
-                .first()
-            )
-        else:
-            customer = (
-                db.query(Customer)
-                .filter(Customer.name == customer_name)
-                .first()
-            )
-        if not customer:
-            # Bu customer aging'de yoksa atla
+        # Python ile eslestir (Turkce karakterler dogru normalize edilir)
+        customers = by_norm.get(_norm(customer_name)) or []
+        if not customers:
             continue
 
         # Region'i cache/DB'den bul/olustur
@@ -352,10 +379,11 @@ def import_customer_regions_df(db: Session, df: pd.DataFrame) -> int:
                 db.flush()  # id almak icin
             regions_cache[region_name] = region
 
-        # Musterinin bolgesini guncelle
-        if customer.region_id != region.id:
-            customer.region_id = region.id
-            updated += 1
+        # Ayni isimdeki TUM musterileri guncelle (farkli customer_no formatlari icin)
+        for customer in customers:
+            if customer.region_id != region.id:
+                customer.region_id = region.id
+                updated += 1
 
     db.commit()
     return updated

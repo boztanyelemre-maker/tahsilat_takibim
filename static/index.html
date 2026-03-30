@@ -2,12 +2,16 @@
 <html lang="tr">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>ALACAK360 – Meeting Mode</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link
       href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
       rel="stylesheet"
     />
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <style>
       :root {
         --primary-color: #00539b; /* TAV tarzı mavi */
@@ -20,6 +24,19 @@
       .kpi-card {
         min-height: 120px;
         border-top: 3px solid var(--primary-color);
+      }
+      /* KPI kartlarinda metin secilebilsin (kopyalama icin) */
+      .kpi-card .card-body {
+        user-select: text;
+        -webkit-user-select: text;
+        overflow: visible;
+      }
+      /* KPI kartlarinda para birimi detayi tasmasin */
+      #kpiTotalOpenByCurr,
+      #kpiOverdueByCurr,
+      #kpiOver90ByCurr {
+        min-width: 0;
+        overflow-wrap: break-word;
       }
       .risk-badge {
         font-size: 0.95rem;
@@ -80,7 +97,46 @@
           <h2 class="mb-0 fs-2">Alacak Tahsilat Takip Paneli</h2>
           <div class="text-muted small">Toplantı Modu · Canlı Data</div>
         </div>
-        <span class="badge bg-secondary" id="costOfCashBadge"></span>
+        <div class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-outline-primary btn-sm" onclick="init().catch(e=>alert(e))" title="Verileri yenile">
+            Yenile
+          </button>
+          <span class="badge bg-secondary" id="costOfCashBadge"></span>
+        </div>
+      </div>
+
+      <div id="emptyDataHint" class="alert alert-info alert-dismissible fade show d-none" role="alert">
+        <div id="emptyDataHintBody" class="small"></div>
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Kapat"></button>
+      </div>
+
+      <!-- Musteri adet tutarsizlik uyarisi -->
+      <div id="customerCountMismatchAlert" class="alert alert-warning alert-dismissible fade show d-none" role="alert">
+        <strong>Uyarı:</strong> Toplam müşteri adedi (KPI) ile bölgeler tablosu toplamı eşleşmiyor. Veri tutarsızlığı olabilir.
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Kapat"></button>
+      </div>
+
+      <!-- Unknown bolge uyarisi -->
+      <div id="unknownRegionAlert" class="alert alert-warning alert-dismissible fade show d-none" role="alert">
+        <strong>Uyarı:</strong>
+        <span id="unknownRegionMessage" class="text-decoration-underline" style="cursor: pointer;" title="Listeyi göster"></span>
+        Bölge ataması yapmak için <a href="/docs" target="_blank">POST /import/customer-regions</a> ile <code>bolge_adlari.xlsx</code> dosyasını yükleyin.
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Kapat"></button>
+      </div>
+
+      <!-- Bolgesiz musteriler modal -->
+      <div class="modal fade" id="unknownCustomersModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h5 class="modal-title">Bölge Ataması Olmayan Müşteriler</h5>
+              <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+              <ul id="unknownCustomersList" class="list-group list-group-flush"></ul>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- KPI Row -->
@@ -94,6 +150,7 @@
                     Toplam Açık Alacak
                   </div>
                   <div class="fs-4 fw-bold" id="kpiTotalOpen">-</div>
+                  <div class="small text-muted" id="kpiCustomerCount"></div>
                 </div>
                 <div
                   class="small text-muted text-end"
@@ -138,17 +195,13 @@
         <div class="col-6 col-lg-3">
           <div class="card kpi-card shadow-sm">
             <div class="card-body">
-              <div class="fw-semibold text-muted small mb-1">
-                Son 30 Gün Geç Ödeme Kaybı
-              </div>
-              <div class="fs-5 fw-bold text-warning" id="kpiLoss30d">-</div>
               <div class="small text-muted mt-1">
                 Toplam Finansal Kayıp:
                 <span class="fw-semibold" id="kpiTotalLateLoss">-</span>
               </div>
               <div class="small text-muted">
                 Güncel Vade Farkı (Tahakkuk):
-                <span class="fw-semibold" id="kpiLateFeeUnpaid">-</span>
+                <span class="fw-semibold" id="kpiLateFeeUnpaid" title="TRY faturalar: açık_bakiye × gecikme_günü × (yıllık_oran/365). Oran: %53,13 (Ayarlar'dan değiştirilebilir).">-</span>
               </div>
               <span class="badge bg-primary-subtle text-primary risk-badge mt-2"
                 >Risk Skoru: <span id="kpiRiskScore">-</span></span
@@ -172,6 +225,7 @@
                   <thead class="table-light">
                     <tr>
                       <th>Bölge</th>
+                      <th class="text-end">Adet</th>
                       <th class="text-end">Açık</th>
                       <th class="text-end">Overdue</th>
                       <th class="text-end">90+</th>
@@ -179,6 +233,16 @@
                     </tr>
                   </thead>
                   <tbody></tbody>
+                  <tfoot class="table-light fw-semibold">
+                    <tr>
+                      <td>Toplam</td>
+                      <td class="text-end" id="regionsAdetToplam">-</td>
+                      <td class="text-end" id="regionsAcikToplam">-</td>
+                      <td class="text-end" id="regionsOverdueToplam">-</td>
+                      <td class="text-end" id="regions90Toplam">-</td>
+                      <td></td>
+                    </tr>
+                  </tfoot>
                 </table>
               </div>
             </div>
@@ -340,11 +404,21 @@
     </div>
 
     <script>
-      // Lokal gelistirme icin backend ile ayni origin'i kullan
-      // Uvicorn'u 127.0.0.1:8000'de calistirip
-      // tarayicidan http://127.0.0.1:8000/static/index.html acarsan
-      // API_BASE'i bos birakmak en temizi:
-      const API_BASE = "";
+      // Lokal gelistirme: file:// acilirsa varsayilan backend
+      const API_BASE = (typeof location !== "undefined" && location.protocol === "file:")
+        ? "http://127.0.0.1:8000"
+        : "";
+      // Cache bypass: her istekte farkli URL (guncel veri icin)
+      function apiUrl(path) {
+        const raw = String(path || "").trim();
+        if (/^https?:\/\//i.test(raw)) {
+          const u = new URL(raw);
+          u.searchParams.set("_", String(Date.now()));
+          return u.toString();
+        }
+        const p = raw.startsWith("/") ? raw : "/" + raw;
+        return API_BASE + p + (p.includes("?") ? "&" : "?") + "_=" + Date.now();
+      }
 
       function fmtAmount(val) {
         if (val == null) return "-";
@@ -362,17 +436,62 @@
       }
 
       function riskColor(score) {
-        if (score >= 80) return "bg-danger";
-        if (score >= 60) return "bg-warning text-dark";
-        if (score >= 30) return "bg-info text-dark";
+        if (score > 50) return "bg-danger";
+        if (score >= 30) return "bg-warning text-dark";
+        if (score >= 10) return "bg-info text-dark";
         return "bg-success";
       }
 
+      function fmtAmountFull(val) {
+        if (val == null) return "-";
+        const n = Number(val);
+        if (isNaN(n)) return "-";
+        return n.toLocaleString("tr-TR", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        });
+      }
+
       async function loadDashboard() {
-        const res = await fetch(API_BASE + "/dashboard");
+        const res = await fetch(apiUrl("/dashboard"), { cache: "no-store" });
+        if (!res.ok) throw new Error("Dashboard: " + res.status + " " + res.statusText);
         const data = await res.json();
-        document.getElementById("kpiTotalOpen").innerText =
-          fmtAmount(data.total_open);
+        const emptyHint = document.getElementById("emptyDataHint");
+        const emptyBody = document.getElementById("emptyDataHintBody");
+        if (emptyHint && emptyBody) {
+          const totalOpen = Number(data.total_open) || 0;
+          const invCount = data.invoice_count ?? 0;
+          if (totalOpen === 0) {
+            emptyHint.classList.remove("d-none");
+            if (invCount === 0) {
+              emptyBody.innerHTML =
+                "<strong>Henüz fatura yok.</strong> Excel’de <code>ham_data</code> adlı sayfa bulunmalı; kolonlarda <code>Open Balance</code> veya <code>Açık Bakiye</code> olmalı. " +
+                '<a href="/docs" target="_blank" class="alert-link">Swagger (/docs)</a> → <code>POST /import/invoices</code> ile dosyayı yükleyin, sonra <strong>Yenile</strong>.';
+            } else {
+              emptyBody.innerHTML =
+                "<strong>Toplam açık bakiye 0.</strong> Veritabanında <strong>" +
+                invCount +
+                "</strong> fatura satırı var; tüm <code>Open Balance</code> değerleri 0 veya kolon adı eşleşmedi. Excel’i kontrol edip yeniden " +
+                '<a href="/docs" target="_blank" class="alert-link">import</a> edin.';
+            }
+          } else {
+            emptyHint.classList.add("d-none");
+          }
+        }
+        const elTotal = document.getElementById("kpiTotalOpen");
+        if (elTotal) {
+          elTotal.innerText = fmtAmount(data.total_open);
+          const byCurr = data.totals_by_currency || [];
+          const currLines = byCurr.map((c) => (c.currency || "N/A") + ": " + fmtAmountFull(c.total_open)).join(" | ");
+          elTotal.title = "Tüm para birimleri (dönüşümsüz): " + (currLines || fmtAmountFull(data.total_open));
+        }
+
+        const elCount = document.getElementById("kpiCustomerCount");
+        if (elCount) {
+          const cnt = data.customer_count ?? 0;
+          elCount.textContent = cnt ? cnt.toLocaleString("tr-TR") + " müşteri" : "";
+          elCount.dataset.customerCount = String(cnt);
+        }
 
         // Para birimi bazinda gorunum
         const byCurr = data.totals_by_currency || [];
@@ -464,8 +583,6 @@
         document.getElementById("kpiOver90").innerText = fmtAmount(
           data.over90
         );
-        document.getElementById("kpiLoss30d").innerText =
-          fmtAmount(data.loss_30d);
         document.getElementById("kpiTotalLateLoss").innerText =
           fmtAmount(data.total_late_loss);
         document.getElementById("kpiLateFeeUnpaid").innerText =
@@ -479,14 +596,25 @@
       }
 
       async function loadRegions() {
-        const res = await fetch(API_BASE + "/regions/summary");
-        const regions = await res.json();
+        const res = await fetch(apiUrl("/regions/summary"), { cache: "no-store" });
+        if (!res.ok) throw new Error("Bölgeler: " + res.status + " " + res.statusText);
+        const data = await res.json();
+        const regions = Array.isArray(data.regions) ? data.regions : (Array.isArray(data) ? data : []);
         const tbody = document.querySelector("#regionsTable tbody");
         tbody.innerHTML = "";
+        let toplamAdet = 0;
+        let toplamAcik = 0;
+        let toplamOverdue = 0;
+        let toplam90 = 0;
         regions.forEach((r) => {
+          toplamAdet += r.customer_count ?? 0;
+          toplamAcik += r.total_open ?? 0;
+          toplamOverdue += r.overdue ?? 0;
+          toplam90 += r.over90 ?? 0;
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td>${r.region_name}</td>
+            <td class="text-end">${(r.customer_count ?? 0).toLocaleString("tr-TR")}</td>
             <td class="text-end">${fmtAmount(r.total_open)}</td>
             <td class="text-end">${fmtAmount(r.overdue)}</td>
             <td class="text-end">${fmtAmount(r.over90)}</td>
@@ -503,11 +631,53 @@
           });
           tbody.appendChild(tr);
         });
+        document.getElementById("regionsAdetToplam").innerText = toplamAdet.toLocaleString("tr-TR");
+        document.getElementById("regionsAdetToplam").dataset.adetToplam = String(toplamAdet);
+        document.getElementById("regionsAcikToplam").innerText = fmtAmount(toplamAcik);
+        document.getElementById("regionsOverdueToplam").innerText = fmtAmount(toplamOverdue);
+        document.getElementById("regions90Toplam").innerText = fmtAmount(toplam90);
+
+        // Musteri adet tutarlilik kontrolu
+        const kpiCount = parseInt(document.getElementById("kpiCustomerCount")?.dataset?.customerCount || "0", 10);
+        const regionsToplam = parseInt(document.getElementById("regionsAdetToplam")?.dataset?.adetToplam || "0", 10);
+        const mismatchEl = document.getElementById("customerCountMismatchAlert");
+        const unknownRow = regions.find((r) => r.region_name === "Unknown" || (r.region_id == null && r.region_name));
+        const unknownAdet = unknownRow ? (unknownRow.customer_count ?? 0) : 0;
+        const unknown0Uyari = unknownRow && unknownAdet === 0 && data.unknown_customer_count > 0;
+        const adetTutarsiz = kpiCount !== regionsToplam;
+        if (adetTutarsiz || unknown0Uyari) {
+          mismatchEl.classList.remove("d-none");
+          let msg = "";
+          if (adetTutarsiz) msg += "Toplam müşteri adedi (KPI: " + kpiCount + ") ile bölgeler toplamı (" + regionsToplam + ") eşleşmiyor. ";
+          if (unknown0Uyari) msg += "Unknown bölgesinde 0 müşteri görünüyor ancak bölge ataması olmayan müşteri var.";
+          mismatchEl.innerHTML = "<strong>Uyarı:</strong> " + (msg || "Veri tutarsızlığı olabilir.") + " <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"alert\" aria-label=\"Kapat\"></button>";
+        } else {
+          mismatchEl.classList.add("d-none");
+        }
+
+        // Unknown bolge uyarisi
+        const alertEl = document.getElementById("unknownRegionAlert");
+        const msgEl = document.getElementById("unknownRegionMessage");
+        const unknownCustomers = data.unknown_customers || [];
+        if (data.has_unknown_regions && data.unknown_customer_count > 0) {
+          alertEl.classList.remove("d-none");
+          msgEl.textContent = data.unknown_customer_count + " müşterinin bölge ataması yok (Unknown).";
+          msgEl.onclick = () => {
+            const listEl = document.getElementById("unknownCustomersList");
+            listEl.innerHTML = unknownCustomers
+              .map((c) => `<li class="list-group-item">${c.customer_name || c.customer_no}</li>`)
+              .join("");
+            new bootstrap.Modal(document.getElementById("unknownCustomersModal")).show();
+          };
+        } else {
+          alertEl.classList.add("d-none");
+          msgEl.onclick = null;
+        }
       }
 
       async function loadTopCustomers(regionId = null, regionName = null) {
         // En riskli musteriler (risk_score'a gore)
-        let url = API_BASE + "/customers/top-risky?limit=10";
+        let url = "/customers/top-risky?limit=10";
         if (regionId !== null && regionId !== undefined) {
           url += "&region_id=" + regionId;
           document.getElementById(
@@ -519,7 +689,7 @@
           ).innerText = "En Riskli 10 Müşteri (Genel)";
         }
 
-        const res = await fetch(url);
+        const res = await fetch(apiUrl(url));
         const customers = await res.json();
         const tbody = document.querySelector("#customersTable tbody");
         tbody.innerHTML = "";
@@ -545,7 +715,7 @@
 
       async function loadTopLossCustomers(regionId = null, regionName = null) {
         // Finansal kaybi en yuksek musteriler
-        let url = API_BASE + "/customers/top-risky?limit=10&sort_by=loss";
+        let url = "/customers/top-risky?limit=10&sort_by=loss";
         if (regionId !== null && regionId !== undefined) {
           url += "&region_id=" + regionId;
           document.getElementById(
@@ -557,7 +727,7 @@
           ).innerText = "Finansal Kayıp En Yüksek 10 Müşteri (Genel)";
         }
 
-        const res = await fetch(url);
+        const res = await fetch(apiUrl(url));
         const customers = await res.json();
         const tbody = document.querySelector("#customersLossTable tbody");
         tbody.innerHTML = "";
@@ -584,7 +754,7 @@
 
       async function loadTopUnpaidCustomers(regionId = null, regionName = null) {
         // Odenmeyen fatura adedi en yuksek musteriler
-        let url = API_BASE + "/customers/top-unpaid?limit=10";
+        let url = "/customers/top-unpaid?limit=10";
         if (regionId !== null && regionId !== undefined) {
           url += "&region_id=" + regionId;
           document.getElementById(
@@ -597,7 +767,7 @@
             "Ödenmeyen Fatura Sayısı En Yüksek 10 Müşteri (Genel)";
         }
 
-        const res = await fetch(url);
+        const res = await fetch(apiUrl(url));
         const customers = await res.json();
         const tbody = document.querySelector("#customersUnpaidTable tbody");
         tbody.innerHTML = "";
@@ -629,7 +799,7 @@
 
         // Summary
         const resSummary = await fetch(
-          API_BASE + `/customers/${encodeURIComponent(customerNo)}/summary`
+          apiUrl(`/customers/${encodeURIComponent(customerNo)}/summary`)
         );
         const s = await resSummary.json();
         document.getElementById(
@@ -649,7 +819,7 @@
 
         // Invoices
         const resInv = await fetch(
-          API_BASE + `/customers/${encodeURIComponent(customerNo)}/invoices`
+          apiUrl(`/customers/${encodeURIComponent(customerNo)}/invoices`)
         );
         const invoices = await resInv.json();
         const invBody = document.querySelector("#invoicesTable tbody");
@@ -673,7 +843,7 @@
 
         // Late payments
         const resPay = await fetch(
-          API_BASE + `/customers/${encodeURIComponent(customerNo)}/late-payments`
+          apiUrl(`/customers/${encodeURIComponent(customerNo)}/late-payments`)
         );
         const pays = await resPay.json();
         const payBody = document.querySelector("#paymentsTable tbody");
@@ -699,10 +869,19 @@
         await loadTopUnpaidCustomers();
       }
 
-      init().catch((err) => {
-        console.error(err);
-        alert("Veri yüklenirken hata oluştu. Konsola bakın.");
-      });
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => {
+          init().catch((err) => {
+            console.error(err);
+            alert("Veri yüklenirken hata oluştu: " + (err?.message || err));
+          });
+        });
+      } else {
+        init().catch((err) => {
+          console.error(err);
+          alert("Veri yüklenirken hata oluştu: " + (err?.message || err));
+        });
+      }
     </script>
   </body>
 </html>

@@ -1,9 +1,17 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SettingsUpdate(BaseModel):
-    cost_of_cash_annual: float
-    late_fee_rate_annual: float
+    cost_of_cash_annual: float | None = Field(
+        None,
+        description="Yıllık cost of cash (%) — finansal kayıp hesapları. Göndermezseniz değişmez.",
+        json_schema_extra={"example": 49.0},
+    )
+    late_fee_rate_annual: float | None = Field(
+        None,
+        description="Vade farkı (tahakkuk) için yıllık oran (%). Vadesi geçmiş TRY açık bakiye × gün × (oran/100/365).",
+        json_schema_extra={"example": 53.13},
+    )
 
 
 class ActionCreate(BaseModel):
